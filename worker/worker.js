@@ -143,16 +143,20 @@ async function getAllSubscriptions(env) {
 
 async function notifySubscribers(env) {
   const subs = await getAllSubscriptions(env);
+  const results = [];
   for (const sub of subs) {
     try {
       const resp = await sendWebPush(sub, env);
+      const bodyText = await resp.text();
       if (resp.status === 404 || resp.status === 410) {
         await env.PARK_KV.delete("sub:" + sub.endpoint);
       }
+      results.push({ endpoint: sub.endpoint, status: resp.status, body: bodyText });
     } catch (err) {
-      console.error("push failed", err);
+      results.push({ endpoint: sub.endpoint, error: String(err) });
     }
   }
+  return { subscriberCount: subs.length, results };
 }
 
 export default {
@@ -168,10 +172,21 @@ export default {
       return new Response(null, { headers: cors });
     }
 
+    if (url.pathname === "/debug") {
+      const subs = await getAllSubscriptions(env);
+      return new Response(
+        JSON.stringify({
+          subscriberCount: subs.length,
+          endpoints: subs.map((s) => s.endpoint.slice(0, 60) + "..."),
+        }),
+        { headers: { "Content-Type": "application/json", ...cors } }
+      );
+    }
+
     if (url.pathname === "/test-push") {
       try {
-        await notifySubscribers(env);
-        return new Response(JSON.stringify({ ok: true }), {
+        const result = await notifySubscribers(env);
+        return new Response(JSON.stringify(result), {
           headers: { "Content-Type": "application/json", ...cors },
         });
       } catch (err) {
