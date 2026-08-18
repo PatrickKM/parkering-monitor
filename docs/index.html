@@ -21,9 +21,9 @@
              background:#1c1c1c; color:#eee; }
   #refresh:active { background:#2a2a2a; }
   #refresh:disabled { opacity:0.5; }
-  #push { margin-top:0.8em; font-size:3vw; padding:0.5em 1.2em; border-radius:2em; border:1px solid #333;
+  #push, #shownotif { margin-top:0.8em; font-size:3vw; padding:0.5em 1.2em; border-radius:2em; border:1px solid #333;
           background:transparent; color:#9c9; }
-  #push:disabled { opacity:0.5; }
+  #push:disabled, #shownotif:disabled { opacity:0.5; }
 </style>
 </head>
 <body>
@@ -32,6 +32,7 @@
   <div id="updated"></div>
   <button id="refresh">Opdater nu</button>
   <button id="push">Aktiver notifikation</button>
+  <button id="shownotif">Vis notifikation</button>
 <script>
 const WORKER_URL = 'https://parking-proxy.patrickkoomadsen.workers.dev';
 const THRESHOLD = 20;
@@ -47,12 +48,15 @@ function urlBase64ToUint8Array(base64String) {
   return arr;
 }
 
+let lastState = null;
+
 function render(available, max, checkedAt, label) {
   const el = document.getElementById('count');
   el.textContent = available;
   el.className = available <= THRESHOLD ? 'low' : '';
   document.getElementById('max').textContent = 'af ' + max + ' pladser';
   document.getElementById('updated').textContent = label + ' ' + checkedAt.toLocaleTimeString('da-DK');
+  lastState = { available, max, checked_at: checkedAt.toISOString() };
 }
 
 async function loadLive() {
@@ -136,6 +140,26 @@ pushBtn.addEventListener('click', async () => {
 });
 
 checkExistingSubscription();
+
+const showNotifBtn = document.getElementById('shownotif');
+showNotifBtn.addEventListener('click', async () => {
+  if (!lastState) return;
+  if (!('serviceWorker' in navigator) || Notification.permission !== 'granted') {
+    alert('Aktiver notifikation først.');
+    return;
+  }
+  const reg = await navigator.serviceWorker.ready;
+  await reg.showNotification('P Gasværksgrunden', {
+    tag: 'parking-status',
+    body: `${lastState.available} ledige (af ${lastState.max}) — opdateret ${new Date(lastState.checked_at).toLocaleTimeString('da-DK')}`,
+    icon: 'icon.svg',
+    badge: 'icon.svg',
+    silent: true,
+    requireInteraction: false,
+    actions: [{ action: 'refresh', title: 'Opdater nu' }],
+    data: { url: './index.html' },
+  });
+});
 </script>
 </body>
 </html>
