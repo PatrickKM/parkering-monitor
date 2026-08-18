@@ -32,15 +32,7 @@ async function fetchLive() {
   return { available: entry.availableCount, max: entry.max_count };
 }
 
-async function sendNtfy(env, title, message, priority, tags) {
-  await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
-    method: "POST",
-    headers: { Title: title, Priority: priority, Tags: tags },
-    body: message,
-  });
-}
-
-async function checkAndNotify(env) {
+async function checkState(env) {
   const { available, max } = await fetchLive();
   const below = available <= THRESHOLD;
 
@@ -48,23 +40,9 @@ async function checkAndNotify(env) {
   const prev = prevRaw ? JSON.parse(prevRaw) : null;
   const wasBelow = !!(prev && prev.below_threshold);
 
-  if (below && !wasBelow) {
-    await sendNtfy(
-      env,
-      "Randers P-plads lav",
-      `Gasværksgrunden, Jernbanegade: kun ${available} ledige pladser (grænse ${THRESHOLD}).`,
-      "urgent",
-      "warning,parking"
-    );
-  } else if (!below && wasBelow) {
-    await sendNtfy(
-      env,
-      "Randers P-plads normal igen",
-      `Gasværksgrunden, Jernbanegade: ${available} ledige pladser igen.`,
-      "default",
-      "white_check_mark"
-    );
-  }
+  let crossed = null;
+  if (below && !wasBelow) crossed = "low";
+  else if (!below && wasBelow) crossed = "normal";
 
   const state = {
     available,
@@ -74,11 +52,10 @@ async function checkAndNotify(env) {
     checked_at: new Date().toISOString(),
   };
   await env.PARK_KV.put(STATE_KEY, JSON.stringify(state));
-  return state;
+  return { state, crossed };
 }
 
-// ---- Web Push (VAPID, no payload encryption — push carries no data, the
-// service worker fetches fresh state itself when woken) ----
+// ---- base64url helpers ----
 
 function b64urlToBytes(b64url) {
   const padding = "=".repeat((4 - (b64url.length % 4)) % 4);
@@ -94,6 +71,19 @@ function bytesToB64url(bytes) {
   for (const b of bytes) str += String.fromCharCode(b);
   return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
+
+function concatBytes(arrays) {
+  const total = arrays.reduce((n, a) => n + a.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const a of arrays) {
+    out.set(a, offset);
+    offset += a.length;
+  }
+  return out;
+}
+
+// ---- VAPID (request authentication) ----
 
 async function importVapidPrivateKey(env) {
   const jwk = JSON.parse(env.VAPID_PRIVATE_KEY_JWK);
@@ -115,17 +105,75 @@ async function buildVapidAuthHeader(endpoint, env) {
   return `vapid t=${jwt}, k=${VAPID_PUBLIC_KEY}`;
 }
 
-async function sendWebPush(subscription, env) {
-  const authHeader = await buildVapidAuthHeader(subscription.endpoint, env);
-  return fetch(subscription.endpoint, {
-    method: "POST",
-    headers: {
-      Authorization: authHeader,
-      TTL: "60",
-      "Content-Length": "0",
-    },
-  });
+// ---- Web Push payload encryption (RFC 8291 / RFC 8188 aes128gcm) ----
+
+async function encryptPayload(subscription, payloadBytes) {
+  const uaPublicBytes = b64urlToBytes(subscription.keys.p256dh);
+  const authSecret = b64urlToBytes(subscription.keys.auth);
+
+  const asKeyPair = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const asPublicRaw = new Uint8Array(await crypto.subtle.exportKey("raw", asKeyPair.publicKey));
+
+  const uaPublicKey = await crypto.subtle.importKey("raw", uaPublicBytes, { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const ecdhSecret = new Uint8Array(
+    await crypto.subtle.deriveBits({ name: "ECDH", public: uaPublicKey }, asKeyPair.privateKey, 256)
+  );
+
+  const enc = new TextEncoder();
+  const keyInfo = concatBytes([enc.encode("WebPush: info"), new Uint8Array([0]), uaPublicBytes, asPublicRaw]);
+
+  const ecdhKey = await crypto.subtle.importKey("raw", ecdhSecret, { name: "HKDF" }, false, ["deriveBits"]);
+  const contentIkm = new Uint8Array(
+    await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: authSecret, info: keyInfo }, ecdhKey, 256)
+  );
+
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const contentIkmKey = await crypto.subtle.importKey("raw", contentIkm, { name: "HKDF" }, false, ["deriveBits"]);
+
+  const cekInfo = concatBytes([enc.encode("Content-Encoding: aes128gcm"), new Uint8Array([0])]);
+  const cek = new Uint8Array(
+    await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt, info: cekInfo }, contentIkmKey, 128)
+  );
+
+  const nonceInfo = concatBytes([enc.encode("Content-Encoding: nonce"), new Uint8Array([0])]);
+  const nonce = new Uint8Array(
+    await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt, info: nonceInfo }, contentIkmKey, 96)
+  );
+
+  const plaintext = concatBytes([payloadBytes, new Uint8Array([2])]); // last-record padding delimiter
+
+  const aesKey = await crypto.subtle.importKey("raw", cek, { name: "AES-GCM" }, false, ["encrypt"]);
+  const ciphertext = new Uint8Array(
+    await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, tagLength: 128 }, aesKey, plaintext)
+  );
+
+  const rs = 4096;
+  const header = concatBytes([
+    salt,
+    new Uint8Array([(rs >>> 24) & 0xff, (rs >>> 16) & 0xff, (rs >>> 8) & 0xff, rs & 0xff]),
+    new Uint8Array([asPublicRaw.length]),
+    asPublicRaw,
+  ]);
+
+  return concatBytes([header, ciphertext]);
 }
+
+async function sendWebPush(subscription, env, payloadObj) {
+  const authHeader = await buildVapidAuthHeader(subscription.endpoint, env);
+  const headers = { Authorization: authHeader, TTL: "60" };
+  let body;
+  if (payloadObj !== undefined) {
+    const payloadBytes = new TextEncoder().encode(JSON.stringify(payloadObj));
+    body = await encryptPayload(subscription, payloadBytes);
+    headers["Content-Type"] = "application/octet-stream";
+    headers["Content-Encoding"] = "aes128gcm";
+  } else {
+    headers["Content-Length"] = "0";
+  }
+  return fetch(subscription.endpoint, { method: "POST", headers, body });
+}
+
+// ---- subscriptions ----
 
 async function saveSubscription(env, sub) {
   await env.PARK_KV.put("sub:" + sub.endpoint, JSON.stringify(sub));
@@ -141,19 +189,18 @@ async function getAllSubscriptions(env) {
   return subs;
 }
 
-async function notifySubscribers(env) {
+async function pushToAll(env, payloadObj) {
   const subs = await getAllSubscriptions(env);
   const results = [];
   for (const sub of subs) {
     try {
-      const resp = await sendWebPush(sub, env);
-      const bodyText = await resp.text();
+      const resp = await sendWebPush(sub, env, payloadObj);
       if (resp.status === 404 || resp.status === 410) {
         await env.PARK_KV.delete("sub:" + sub.endpoint);
       }
-      results.push({ endpoint: sub.endpoint, status: resp.status, body: bodyText });
+      results.push({ endpoint: sub.endpoint.slice(0, 60), status: resp.status });
     } catch (err) {
-      results.push({ endpoint: sub.endpoint, error: String(err) });
+      results.push({ endpoint: sub.endpoint.slice(0, 60), error: String(err) });
     }
   }
   return { subscriberCount: subs.length, results };
@@ -175,20 +222,30 @@ export default {
     if (url.pathname === "/debug") {
       const subs = await getAllSubscriptions(env);
       return new Response(
-        JSON.stringify({
-          subscriberCount: subs.length,
-          endpoints: subs.map((s) => s.endpoint.slice(0, 60) + "..."),
-        }),
+        JSON.stringify({ subscriberCount: subs.length, endpoints: subs.map((s) => s.endpoint.slice(0, 60) + "...") }),
         { headers: { "Content-Type": "application/json", ...cors } }
       );
     }
 
     if (url.pathname === "/test-push") {
       try {
-        const result = await notifySubscribers(env);
-        return new Response(JSON.stringify(result), {
+        const { state } = await checkState(env);
+        const result = await pushToAll(env, { kind: "update", ...state });
+        return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json", ...cors } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: String(err) }), {
+          status: 500,
           headers: { "Content-Type": "application/json", ...cors },
         });
+      }
+    }
+
+    if (url.pathname === "/test-alert") {
+      try {
+        const kind = url.searchParams.get("kind") === "normal" ? "alert-normal" : "alert-low";
+        const { state } = await checkState(env);
+        const result = await pushToAll(env, { kind, ...state });
+        return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json", ...cors } });
       } catch (err) {
         return new Response(JSON.stringify({ error: String(err) }), {
           status: 500,
@@ -214,10 +271,8 @@ export default {
     }
 
     try {
-      const state = await checkAndNotify(env);
-      return new Response(JSON.stringify(state), {
-        headers: { "Content-Type": "application/json", ...cors },
-      });
+      const { state } = await checkState(env);
+      return new Response(JSON.stringify(state), { headers: { "Content-Type": "application/json", ...cors } });
     } catch (err) {
       return new Response(JSON.stringify({ error: String(err) }), {
         status: 502,
@@ -228,9 +283,15 @@ export default {
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
-      checkAndNotify(env)
-        .then(() => notifySubscribers(env))
-        .catch((err) => console.error(err))
+      (async () => {
+        const { state, crossed } = await checkState(env);
+        await pushToAll(env, { kind: "update", ...state });
+        if (crossed === "low") {
+          await pushToAll(env, { kind: "alert-low", ...state });
+        } else if (crossed === "normal") {
+          await pushToAll(env, { kind: "alert-normal", ...state });
+        }
+      })().catch((err) => console.error(err))
     );
   },
 };
