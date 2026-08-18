@@ -1,8 +1,10 @@
 name: Check Randers parking
 
+# Scheduled checking + ntfy alerts have moved to the Cloudflare Worker
+# (worker/worker.js, Cron Trigger every 10 min) — GitHub's own `schedule:`
+# drifted to ~30 min under load. Kept as workflow_dispatch only, for a
+# manual backup run / debugging.
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 permissions:

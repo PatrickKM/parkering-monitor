@@ -1,0 +1,11 @@
+name = "parking-proxy"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Required bindings (set via dashboard: Worker -> Settings -> Bindings,
+# or via `wrangler kv namespace create` + `wrangler secret put` if deploying with wrangler CLI):
+#   - KV namespace binding named PARK_KV (stores last known state for edge-trigger alerting)
+#   - Secret named NTFY_TOPIC (your ntfy.sh topic)
+
+[triggers]
+crons = ["*/10 * * * *"]

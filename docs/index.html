@@ -17,12 +17,17 @@
   #max { font-size:5vw; opacity:0.6; }
   #updated { font-size:3vw; opacity:0.5; margin-top:1em; }
   .low { color:#ff5555; }
+  #refresh { margin-top:1.5em; font-size:4vw; padding:0.6em 1.4em; border-radius:2em; border:1px solid #444;
+             background:#1c1c1c; color:#eee; }
+  #refresh:active { background:#2a2a2a; }
+  #refresh:disabled { opacity:0.5; }
 </style>
 </head>
 <body>
   <div id="count">…</div>
   <div id="max"></div>
   <div id="updated"></div>
+  <button id="refresh">Opdater nu</button>
 <script>
 const WORKER_URL = 'https://parking-proxy.YOUR-SUBDOMAIN.workers.dev'; // TODO: replace after deploying the Worker
 const THRESHOLD = 20;
@@ -63,6 +68,13 @@ async function load() {
     }
   }
 }
+const refreshBtn = document.getElementById('refresh');
+refreshBtn.addEventListener('click', async () => {
+  refreshBtn.disabled = true;
+  await load();
+  refreshBtn.disabled = false;
+});
+
 load();
 setInterval(load, 60000);
 
