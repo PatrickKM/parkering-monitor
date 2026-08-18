@@ -168,6 +168,20 @@ export default {
       return new Response(null, { headers: cors });
     }
 
+    if (url.pathname === "/test-push") {
+      try {
+        await notifySubscribers(env);
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: { "Content-Type": "application/json", ...cors },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: String(err) }), {
+          status: 500,
+          headers: { "Content-Type": "application/json", ...cors },
+        });
+      }
+    }
+
     if (url.pathname === "/subscribe" && request.method === "POST") {
       try {
         const sub = await request.json();
