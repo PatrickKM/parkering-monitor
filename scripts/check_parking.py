@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,23 +12,34 @@ THRESHOLD = int(os.environ.get("PARKING_THRESHOLD", "20"))
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 STATUS_FILE = Path(__file__).resolve().parent.parent / "docs" / "status.json"
 
-OBJ_RE = re.compile(r"\{[^{}]*\"id_level\"\s*:\s*" + str(ID_LEVEL) + r"\b[^{}]*\}")
-AVAIL_RE = re.compile(r"\"availableCount\"\s*:\s*(\d+)")
-MAX_RE = re.compile(r"\"max_count\"\s*:\s*(\d+)")
+MARKER = "var parkInfo = "
+
+
+def extract_park_info_array(html):
+    start = html.find(MARKER)
+    if start == -1:
+        raise RuntimeError("'var parkInfo' declaration not found — site markup may have changed")
+    start_arr = start + len(MARKER)
+    depth = 0
+    for i in range(start_arr, len(html)):
+        c = html[i]
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return json.loads(html[start_arr : i + 1])
+    raise RuntimeError("unterminated parkInfo array")
 
 
 def fetch_counts():
     resp = requests.get(URL, timeout=30)
     resp.raise_for_status()
-    match = OBJ_RE.search(resp.text)
-    if not match:
-        raise RuntimeError("id_level 3 block not found in page — site markup may have changed")
-    chunk = match.group(0)
-    avail = AVAIL_RE.search(chunk)
-    mx = MAX_RE.search(chunk)
-    if not avail or not mx:
-        raise RuntimeError("availableCount/max_count not found in matched block")
-    return int(avail.group(1)), int(mx.group(1))
+    park_info = extract_park_info_array(resp.text)
+    for entry in park_info:
+        if entry.get("id_level") == ID_LEVEL:
+            return int(entry["availableCount"]), int(entry["max_count"])
+    raise RuntimeError(f"id_level {ID_LEVEL} not found in parkInfo array")
 
 
 def send_ntfy(title, message, priority="default", tags=None):
