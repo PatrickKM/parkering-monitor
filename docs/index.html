@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="da">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P Gasværksgrunden</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#111; color:#eee; display:flex; flex-direction:column;
+         align-items:center; justify-content:center; height:100vh; margin:0; text-align:center; }
+  #count { font-size: 22vw; font-weight:700; line-height:1; }
+  #max { font-size:5vw; opacity:0.6; }
+  #updated { font-size:3vw; opacity:0.5; margin-top:1em; }
+  .low { color:#ff5555; }
+</style>
+</head>
+<body>
+  <div id="count">…</div>
+  <div id="max"></div>
+  <div id="updated"></div>
+<script>
+async function load() {
+  try {
+    const r = await fetch('status.json?_=' + Date.now());
+    const d = await r.json();
+    const el = document.getElementById('count');
+    el.textContent = d.available;
+    el.className = d.below_threshold ? 'low' : '';
+    document.getElementById('max').textContent = 'af ' + d.max + ' pladser';
+    document.getElementById('updated').textContent = 'opdateret ' + new Date(d.checked_at).toLocaleTimeString('da-DK');
+  } catch (e) {
+    document.getElementById('count').textContent = '?';
+  }
+}
+load();
+setInterval(load, 60000);
+</script>
+</body>
+</html>
