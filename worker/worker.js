@@ -158,9 +158,9 @@ async function encryptPayload(subscription, payloadBytes) {
   return concatBytes([header, ciphertext]);
 }
 
-async function sendWebPush(subscription, env, payloadObj) {
+async function sendWebPush(subscription, env, payloadObj, urgency = "normal", ttl = 60) {
   const authHeader = await buildVapidAuthHeader(subscription.endpoint, env);
-  const headers = { Authorization: authHeader, TTL: "60" };
+  const headers = { Authorization: authHeader, TTL: String(ttl), Urgency: urgency };
   let body;
   if (payloadObj !== undefined) {
     const payloadBytes = new TextEncoder().encode(JSON.stringify(payloadObj));
@@ -189,12 +189,12 @@ async function getAllSubscriptions(env) {
   return subs;
 }
 
-async function pushToAll(env, payloadObj) {
+async function pushToAll(env, payloadObj, urgency = "normal", ttl = 60) {
   const subs = await getAllSubscriptions(env);
   const results = [];
   for (const sub of subs) {
     try {
-      const resp = await sendWebPush(sub, env, payloadObj);
+      const resp = await sendWebPush(sub, env, payloadObj, urgency, ttl);
       if (resp.status === 404 || resp.status === 410) {
         await env.PARK_KV.delete("sub:" + sub.endpoint);
       }
@@ -230,7 +230,7 @@ export default {
     if (url.pathname === "/test-push") {
       try {
         const { state } = await checkState(env);
-        const result = await pushToAll(env, { kind: "update", ...state });
+        const result = await pushToAll(env, { kind: "update", ...state }, "low", 900);
         return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json", ...cors } });
       } catch (err) {
         return new Response(JSON.stringify({ error: String(err) }), {
@@ -244,7 +244,7 @@ export default {
       try {
         const kind = url.searchParams.get("kind") === "normal" ? "alert-normal" : "alert-low";
         const { state } = await checkState(env);
-        const result = await pushToAll(env, { kind, ...state });
+        const result = await pushToAll(env, { kind, ...state }, "high", 600);
         return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json", ...cors } });
       } catch (err) {
         return new Response(JSON.stringify({ error: String(err) }), {
@@ -285,11 +285,15 @@ export default {
     ctx.waitUntil(
       (async () => {
         const { state, crossed } = await checkState(env);
-        await pushToAll(env, { kind: "update", ...state });
+        // Routine glance update: low urgency + long TTL — Android/Chrome may hold this
+        // until the phone wakes from Doze rather than deliver it immediately, which is
+        // the desired "quiet while locked, fresh when you check" behavior.
+        await pushToAll(env, { kind: "update", ...state }, "low", 900);
         if (crossed === "low") {
-          await pushToAll(env, { kind: "alert-low", ...state });
+          // Threshold alert: high urgency cuts through Doze and delivers right away.
+          await pushToAll(env, { kind: "alert-low", ...state }, "high", 600);
         } else if (crossed === "normal") {
-          await pushToAll(env, { kind: "alert-normal", ...state });
+          await pushToAll(env, { kind: "alert-normal", ...state }, "high", 600);
         }
       })().catch((err) => console.error(err))
     );
