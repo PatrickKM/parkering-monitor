@@ -2,6 +2,8 @@ const SOURCE_URL = "https://www.cibos2.dk/parkeringranders";
 const ID_LEVEL = 3;
 const THRESHOLD = 20;
 const STATE_KEY = "state";
+const TIMEZONE = "Europe/Copenhagen";
+const SNAPSHOT_HOUR = 7; // record history entries during the 07:00-07:59 local window
 const VAPID_SUBJECT = "mailto:pkm@grafikr.dk";
 // Public half of the VAPID key pair — not secret, must match docs/index.html's VAPID_PUBLIC_KEY.
 const VAPID_PUBLIC_KEY = "BMXdPepcic_OEKsEY-agIMF1lvxUQWCgOai38w8E2f5D5YVNz5mcwE4N0X6GuFLEqHGFYQbNsmW1heVkmZMcr4w";
@@ -53,6 +55,32 @@ async function checkState(env) {
   };
   await env.PARK_KV.put(STATE_KEY, JSON.stringify(state));
   return { state, crossed };
+}
+
+function localParts(date, timeZone) {
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(date).map((p) => [p.type, p.value]));
+  return { dateStr: `${parts.year}-${parts.month}-${parts.day}`, hour: parseInt(parts.hour, 10), minute: parts.minute };
+}
+
+async function recordMorningSnapshot(env, state) {
+  const { dateStr, hour, minute } = localParts(new Date(), TIMEZONE);
+  if (hour !== SNAPSHOT_HOUR) return;
+  const key = "history:" + dateStr;
+  const raw = await env.PARK_KV.get(key);
+  const list = raw ? JSON.parse(raw) : [];
+  const time = `${String(hour).padStart(2, "0")}:${minute}`;
+  if (list.some((s) => s.time === time)) return; // already recorded this minute
+  list.push({ time, available: state.available, max: state.max });
+  await env.PARK_KV.put(key, JSON.stringify(list), { expirationTtl: 60 * 60 * 24 * 60 });
 }
 
 // ---- base64url helpers ----
@@ -219,6 +247,15 @@ export default {
       return new Response(null, { headers: cors });
     }
 
+    if (url.pathname === "/history") {
+      const dateStr = url.searchParams.get("date") || localParts(new Date(), TIMEZONE).dateStr;
+      const raw = await env.PARK_KV.get("history:" + dateStr);
+      const snapshots = raw ? JSON.parse(raw) : [];
+      return new Response(JSON.stringify({ date: dateStr, snapshots }), {
+        headers: { "Content-Type": "application/json", ...cors },
+      });
+    }
+
     if (url.pathname === "/debug") {
       const subs = await getAllSubscriptions(env);
       return new Response(
@@ -285,6 +322,7 @@ export default {
     ctx.waitUntil(
       (async () => {
         const { state, crossed } = await checkState(env);
+        await recordMorningSnapshot(env, state);
         // Routine glance update: low urgency + long TTL — Android/Chrome may hold this
         // until the phone wakes from Doze rather than deliver it immediately, which is
         // the desired "quiet while locked, fresh when you check" behavior.
