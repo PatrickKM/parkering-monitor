@@ -3,7 +3,7 @@ const ID_LEVEL = 3;
 const THRESHOLD = 20;
 const STATE_KEY = "state";
 const TIMEZONE = "Europe/Copenhagen";
-const SNAPSHOT_HOUR = 7; // record history entries during the 07:00-07:59 local window
+const SNAPSHOT_HOURS = [7, 8]; // record history entries during the 07:00-08:59 local window
 const VAPID_SUBJECT = "mailto:pkm@grafikr.dk";
 // Public half of the VAPID key pair — not secret, must match docs/index.html's VAPID_PUBLIC_KEY.
 const VAPID_PUBLIC_KEY = "BMXdPepcic_OEKsEY-agIMF1lvxUQWCgOai38w8E2f5D5YVNz5mcwE4N0X6GuFLEqHGFYQbNsmW1heVkmZMcr4w";
@@ -71,16 +71,36 @@ function localParts(date, timeZone) {
   return { dateStr: `${parts.year}-${parts.month}-${parts.day}`, hour: parseInt(parts.hour, 10), minute: parts.minute };
 }
 
+function mondayOfWeek(dateStr) {
+  const d = new Date(dateStr + "T00:00:00Z");
+  const day = d.getUTCDay(); // 0=Sun..6=Sat
+  const diff = day === 0 ? 6 : day - 1; // days since Monday
+  d.setUTCDate(d.getUTCDate() - diff);
+  return d.toISOString().slice(0, 10);
+}
+
+function weekdayDatesFrom(monday) {
+  const dates = [];
+  const d = new Date(monday + "T00:00:00Z");
+  for (let i = 0; i < 5; i++) {
+    dates.push(d.toISOString().slice(0, 10));
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return dates;
+}
+
 async function recordMorningSnapshot(env, state) {
   const { dateStr, hour, minute } = localParts(new Date(), TIMEZONE);
-  if (hour !== SNAPSHOT_HOUR) return;
-  const key = "history:" + dateStr;
-  const raw = await env.PARK_KV.get(key);
-  const list = raw ? JSON.parse(raw) : [];
+  if (!SNAPSHOT_HOURS.includes(hour)) return;
+  const weekKey = "history:" + mondayOfWeek(dateStr);
+  const raw = await env.PARK_KV.get(weekKey);
+  const week = raw ? JSON.parse(raw) : {};
+  const dayList = week[dateStr] || [];
   const time = `${String(hour).padStart(2, "0")}:${minute}`;
-  if (list.some((s) => s.time === time)) return; // already recorded this minute
-  list.push({ time, available: state.available, max: state.max });
-  await env.PARK_KV.put(key, JSON.stringify(list), { expirationTtl: 60 * 60 * 24 * 60 });
+  if (dayList.some((s) => s.time === time)) return; // already recorded this minute
+  dayList.push({ time, available: state.available, max: state.max });
+  week[dateStr] = dayList;
+  await env.PARK_KV.put(weekKey, JSON.stringify(week), { expirationTtl: 60 * 60 * 24 * 90 });
 }
 
 // ---- base64url helpers ----
@@ -248,10 +268,18 @@ export default {
     }
 
     if (url.pathname === "/history") {
-      const dateStr = url.searchParams.get("date") || localParts(new Date(), TIMEZONE).dateStr;
-      const raw = await env.PARK_KV.get("history:" + dateStr);
-      const snapshots = raw ? JSON.parse(raw) : [];
-      return new Response(JSON.stringify({ date: dateStr, snapshots }), {
+      const dateParam = url.searchParams.get("date") || localParts(new Date(), TIMEZONE).dateStr;
+      const weekStart = mondayOfWeek(dateParam);
+      const raw = await env.PARK_KV.get("history:" + weekStart);
+      const days = raw ? JSON.parse(raw) : {};
+      // fall back to the old single-day key format for any date not yet migrated
+      for (const d of weekdayDatesFrom(weekStart)) {
+        if (!days[d]) {
+          const legacy = await env.PARK_KV.get("history:" + d);
+          if (legacy) days[d] = JSON.parse(legacy);
+        }
+      }
+      return new Response(JSON.stringify({ weekStart, days }), {
         headers: { "Content-Type": "application/json", ...cors },
       });
     }
