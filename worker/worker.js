@@ -92,7 +92,11 @@ function weekdayDatesFrom(monday) {
 async function recordMorningSnapshot(env, state) {
   const { dateStr, hour, minute } = localParts(new Date(), TIMEZONE);
   if (!SNAPSHOT_HOURS.includes(hour)) return;
-  const weekKey = "history:" + mondayOfWeek(dateStr);
+  // Separate prefix from the legacy "history:<date>" single-day keys — reusing that
+  // prefix for "history:<mondayDate>" collided whenever a week's Monday fell on a date
+  // that already held an old-format array, silently discarding every write after it
+  // (JSON.stringify on an array drops non-index properties like week[dateStr] = ...).
+  const weekKey = "week:" + mondayOfWeek(dateStr);
   const raw = await env.PARK_KV.get(weekKey);
   const week = raw ? JSON.parse(raw) : {};
   const dayList = week[dateStr] || [];
@@ -270,7 +274,7 @@ export default {
     if (url.pathname === "/history") {
       const dateParam = url.searchParams.get("date") || localParts(new Date(), TIMEZONE).dateStr;
       const weekStart = mondayOfWeek(dateParam);
-      const raw = await env.PARK_KV.get("history:" + weekStart);
+      const raw = await env.PARK_KV.get("week:" + weekStart);
       const days = raw ? JSON.parse(raw) : {};
       // fall back to the old single-day key format for any date not yet migrated
       for (const d of weekdayDatesFrom(weekStart)) {
